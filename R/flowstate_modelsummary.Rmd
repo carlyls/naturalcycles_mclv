@@ -1,0 +1,691 @@
+---
+title: 'Flow State: Aim 1 Summary of Model'
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Model & Data Read-In
+
+```{r}
+library(tidyverse)
+library(readr)
+library(here)
+library(gt)
+library(countrycode)
+library(forcats)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(table1)
+library(patchwork)
+library(ggridges)
+library(ggtext)
+
+#Data: eas
+#Model: bayes_single
+```
+
+## Model Summary
+
+```{r}
+#coefficient table
+summary(bayes_single)
+```
+
+```{r}
+#specific coefficient plots
+conditional_effects(bayes_single)
+```
+
+```{r}
+#evaluate convergence
+plot(bayes_single)
+```
+
+```{r}
+#check posterior distributions vs true distribution
+pp_check(bayes_single) 
+```
+
+```{r}
+#priors
+prior_summary(bayes_single)
+```
+
+```{r, eval = F}
+#examine random effects
+ranef(bayes_single)$ui_userN |> str()
+VarCorr(bayes_single)
+```
+
+### Interpretations
+
+```{r}
+fit   <- bayes_single
+train <- fit$data %>% mutate(ui_userN = droplevels(ui_userN))
+
+y_obs <- train$ci_cycleLength
+stopifnot(is.numeric(y_obs))
+```
+
+#### Covariate Effects
+
+```{r}
+#Covariate effects in clinician units (mu in days, sigma in % change)
+draws <- posterior::as_draws_df(fit)
+```
+
+```{r}
+#mean effects: exclude intercept
+mu_eff <- draws %>%
+  dplyr::select(starts_with("b_"),
+         -starts_with("b_sigma_"),
+         -b_Intercept) %>%
+  pivot_longer(everything(), names_to = "term", values_to = "beta") %>%
+  mutate(
+    panel = "Association with average length (μ, % difference)",  # updated label
+    term  = sub("^b_", "", term),
+    effect = 100 * (exp(beta) - 1)                            # updated formula
+  )
+
+#sigma effects: exclude sigma intercept
+sig_eff <- draws %>%
+  dplyr::select(starts_with("b_sigma_"),
+         -b_sigma_Intercept) %>%  # <-- remove sigma intercept
+  pivot_longer(everything(), names_to = "term", values_to = "beta") %>%
+  mutate(
+    panel = "Association with variability (σ, % difference)",
+    term  = sub("^b_sigma_", "", term),
+    effect = 100 * (exp(beta) - 1)
+  )
+
+# Combine
+eff_sum <- bind_rows(mu_eff, sig_eff) %>%
+  group_by(panel, term) %>%
+  summarise(
+    med = median(effect),
+    lo = quantile(effect, 0.025),
+    hi = quantile(effect, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(term = fct_reorder(term, med))
+
+#plot
+ggplot(eff_sum, aes(y = label, x = med, xmin = lo, xmax = hi)) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_pointrange() +
+  facet_wrap(~panel, scales = "free_x") +
+  labs(
+    x = NULL,
+    y = NULL,
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### Variance Decomposition
+
+```{r}
+# Raw variance components from the model
+vc <- VarCorr(fit)
+ 
+# ICC for the mean (mu) sub-model
+# For a log-normal mixed model the within-woman "residual" variance on the log
+# scale is sigma^2 (the dispersion parameter).  The between-woman variance is
+# tau^2_mu (random intercept SD squared).
+# We compute both from the posterior draws for a proper uncertainty estimate.
+ 
+# Posterior draws for the random-effect SDs
+tau_mu    <- draws$`sd_ui_userN__Intercept`          # between-woman SD (mu)
+tau_sigma <- draws$`sd_ui_userN__sigma_Intercept`    # between-woman SD (sigma)
+ 
+# Posterior draws for the population-level sigma intercept (log scale)
+# exp(b_sigma_Intercept) ≈ median within-woman sigma
+sigma_intercept_log <- draws$b_sigma_Intercept
+sigma_within        <- exp(sigma_intercept_log)         # median within-woman sigma
+ 
+# ICC for mu:  tau_mu^2 / (tau_mu^2 + sigma_within^2)
+# (sigma_within^2 is the average within-woman variance on the log scale)
+icc_mu <- (tau_mu^2) / (tau_mu^2 + sigma_within^2)
+ 
+# ICC for sigma (log-scale regularity):
+# between-woman sigma-SD^2 / (between + average within residual variance)
+# Use pi^2/3 as a reference within-cluster variance on log scale (logistic approx.)
+icc_sigma <- (tau_sigma^2) / (tau_sigma^2 + (pi^2 / 3))
+```
+
+```{r}
+cat("\n========== VARIANCE DECOMPOSITION ==========\n")
+cat(sprintf(
+  "Between-woman SD (mu, log scale):    %.3f  [95%% CrI: %.3f, %.3f]\n",
+  median(tau_mu), quantile(tau_mu, 0.025), quantile(tau_mu, 0.975)
+))
+cat(sprintf(
+  "Median within-woman sigma:           %.3f  [95%% CrI: %.3f, %.3f]\n",
+  median(sigma_within), quantile(sigma_within, 0.025), quantile(sigma_within, 0.975)
+))
+cat(sprintf(
+  "ICC (mu)   – %% of log-scale variance between women: %.1f%%  [%.1f%%, %.1f%%]\n",
+  100 * median(icc_mu),
+  100 * quantile(icc_mu, 0.025),
+  100 * quantile(icc_mu, 0.975)
+))
+cat(sprintf(
+  "Between-woman SD (sigma, log scale): %.3f  [95%% CrI: %.3f, %.3f]\n",
+  median(tau_sigma), quantile(tau_sigma, 0.025), quantile(tau_sigma, 0.975)
+))
+cat(sprintf(
+  "ICC (sigma) – %% of log-scale sigma variance between women: %.1f%%  [%.1f%%, %.1f%%]\n",
+  100 * median(icc_sigma),
+  100 * quantile(icc_sigma, 0.025),
+  100 * quantile(icc_sigma, 0.975)
+))
+```
+
+```{r}
+## more summary output
+# Between-woman SD in days
+tau_mu_days <- exp(mean(draws$b_Intercept)) * draws$`sd_ui_userN__Intercept`
+median(tau_mu_days)
+quantile(tau_mu_days, c(0.025, 0.975))
+
+# One SD above and below in irregularity
+sigma_intercept <- draws$b_sigma_Intercept
+tau_sigma <- draws$`sd_ui_userN__sigma_Intercept`
+mu_intercept <- draws$b_Intercept
+
+# One SD above in irregularity
+sd_above <- exp(mu_intercept) * sqrt(exp(exp(sigma_intercept + tau_sigma)^2) - 1)
+median(sd_above)
+
+# One SD below in irregularity
+sd_below <- exp(mu_intercept) * sqrt(exp(exp(sigma_intercept - tau_sigma)^2) - 1)
+median(sd_below)
+```
+
+
+### Data Visualizations
+
+#### Posterior Predictive Check
+
+```{r}
+#overall posterior predictive check
+set.seed(1)
+yrep <- brms::posterior_predict(
+  fit,
+  newdata = train,
+  re_formula = NULL,   # include woman-specific REs
+  ndraws = 400
+)  # matrix: draws x N
+dim(yrep)
+```
+
+```{r}
+#plot observed vs predicted densities
+# Sample a subset of draws for plotting (avoid overplotting)
+draw_idx <- sample(seq_len(nrow(yrep)), size = min(50, nrow(yrep)))
+
+yrep_long <- tibble(
+  draw = rep(draw_idx, each = ncol(yrep)),
+  y = as.vector(yrep[draw_idx, , drop = FALSE])
+)
+
+ggplot() +
+  geom_density(data = yrep_long, aes(x = y, group = draw), color = "grey", alpha = 0.05) +
+  geom_density(aes(x = y_obs), linewidth = 1.2, color = "blue") +
+  coord_cartesian(xlim = c(min(y_obs), 60)) +
+  labs(
+    x = "Cycle length (days)",
+    y = "Density",
+    title = "Posterior predictive check: distribution of cycle lengths",
+    subtitle = "Black = observed; gray = replicated datasets (includes long right tail)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### Woman-Level Predictive Intervals
+
+```{r}
+#heterogeneity across women
+#Woman-level predictive intervals (“forest plot”), show top 60 women
+id <- train$ui_userN
+ids <- levels(id)
+
+woman_q <- function(u) {
+  cols <- which(id == u)
+  vals <- as.vector(yrep[, cols, drop = FALSE])
+  tibble(
+    ui_userN = u,
+    med = median(vals),
+    lo50 = quantile(vals, 0.25),
+    hi50 = quantile(vals, 0.75),
+    lo80 = quantile(vals, 0.10),
+    hi80 = quantile(vals, 0.90),
+    lo95 = quantile(vals, 0.025),
+    hi95 = quantile(vals, 0.975)
+  )
+}
+
+pp_by_woman <- bind_rows(lapply(ids, woman_q)) %>%
+  arrange(med) %>%
+  mutate(ui_userN_ord = fct_inorder(as.factor(ui_userN)))
+
+pp_plot <- pp_by_woman %>% slice_head(n = 30)
+
+ggplot(pp_plot, aes(y = ui_userN_ord)) +
+  geom_segment(aes(x = lo95, xend = hi95, yend = ui_userN_ord), linewidth = 0.6, alpha = 0.25) +
+  geom_segment(aes(x = lo80, xend = hi80, yend = ui_userN_ord), linewidth = 1.0, alpha = 0.45) +
+  geom_segment(aes(x = lo50, xend = hi50, yend = ui_userN_ord), linewidth = 1.8, alpha = 0.75) +
+  geom_point(aes(x = med), size = 1.6) +
+  labs(
+    x = "Predicted cycle length for a new cycle (days)",
+    y = NULL,
+    title = "Heterogeneity across women: predicted cycle ranges",
+    subtitle = "Each row = woman; bars = 50/80/95% predictive intervals; top 30 shown"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+```{r, eval = F}
+#Forest plot (bayesplot style)
+mcmc_areas_ridge_dat <- bind_rows(
+  draws %>%
+    select(starts_with("b_"), -starts_with("b_sigma_"), -b_Intercept) %>%
+    mutate(model = "mu"),
+  draws %>%
+    select(starts_with("b_sigma_"), -b_sigma_Intercept) %>%
+    rename_with(~ sub("b_sigma_", "b_", .x)) %>%
+    mutate(model = "sigma")
+)
+ 
+# mu panel
+mu_pars <- names(draws)[str_detect(names(draws), "^b_") &
+                         !str_detect(names(draws), "^b_sigma_") &
+                         names(draws) != "b_Intercept"]
+sig_pars <- names(draws)[str_detect(names(draws), "^b_sigma_") &
+                          names(draws) != "b_sigma_Intercept"]
+ 
+p_mu <- mcmc_areas(draws, pars = mu_pars, prob = 0.95) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  labs(title = "Mu sub-model: covariate effects (log scale)",
+       subtitle = "Shaded = 95% CrI") +
+  theme_minimal(base_size = 12)
+ 
+p_sig <- mcmc_areas(draws, pars = sig_pars, prob = 0.95) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  labs(title = "Sigma sub-model: covariate effects (log scale)",
+       subtitle = "Shaded = 95% CrI") +
+  theme_minimal(base_size = 12)
+
+p_mu
+p_sig
+```
+
+
+#### Within-Woman Regularity
+
+```{r}
+## EXACT LOGNORMAL SD IN DAYS (per woman)
+# True SD of a log-normal(mu, sigma) = exp(mu + sigma^2/2) * sqrt(exp(sigma^2) - 1)
+# We need woman-level posterior draws for both mu and sigma.
+ 
+dat_women <- train %>%
+  group_by(ui_userN) %>%
+  summarise(
+    n_cycles = n(),
+    ci_age_group            = first(ci_age_group),
+    ui_ansMenarche_group    = first(ui_ansMenarche_group),
+    ui_pcos_impute          = first(ui_pcos_impute),
+    ui_endometriosis_impute = first(ui_endometriosis_impute),
+    ui_bmi_cat              = first(ui_bmi_cat),
+    ui_activitylevel        = first(ui_activitylevel),
+    ci_spotting_logged      = FALSE,
+    ci_sickness_logged      = FALSE,
+    ci_mood_logged          = FALSE,
+    .groups = "drop"
+  )
+ 
+# Posterior draws: mu (response scale = days) and sigma (log scale)
+mu_draws_mat    <- posterior_epred(fit, newdata = dat_women, re_formula = NULL)
+sigma_draws_mat <- posterior_linpred(fit, dpar = "sigma", newdata = dat_women,
+                                     re_formula = NULL, transform = TRUE)
+ 
+# For each draw, compute true lognormal SD per woman
+# then summarize over draws
+n_draws <- nrow(mu_draws_mat)
+n_women <- ncol(mu_draws_mat)
+ 
+# log-scale mu per woman per draw: log(E[Y]) - sigma^2/2  ≈  log(mu_draws)
+# More precisely: log-scale mu = log(mu_epred) - sigma^2/2
+log_mu_mat <- log(mu_draws_mat) - (sigma_draws_mat^2) / 2
+ 
+sd_days_mat <- exp(log_mu_mat + sigma_draws_mat^2 / 2) *
+               sqrt(exp(sigma_draws_mat^2) - 1)
+ 
+# Woman-level summaries
+sd_days_summary <- tibble(
+  ui_userN = dat_women$ui_userN,
+  sd_med   = apply(sd_days_mat, 2, median),
+  sd_lo    = apply(sd_days_mat, 2, function(x) quantile(x, 0.025)),
+  sd_hi    = apply(sd_days_mat, 2, function(x) quantile(x, 0.975))
+)
+ 
+mean_days_summary <- tibble(
+  ui_userN  = dat_women$ui_userN,
+  mean_med  = apply(mu_draws_mat, 2, median)
+)
+```
+
+```{r}
+#population level averages
+pop_mean_per_draw <- rowMeans(mu_draws_mat)
+median(pop_mean_per_draw)
+quantile(pop_mean_per_draw, c(0.025, 0.975))
+pop_mean <- median(pop_mean_per_draw)  # 29.2 days
+
+pop_sd_per_draw <- rowMeans(sd_days_mat)
+median(pop_sd_per_draw)
+quantile(pop_sd_per_draw, c(0.025, 0.975))
+pop_sd   <- median(pop_sd_per_draw)    # 3.2 days
+```
+
+```{r}
+# Distribution of true SD in days
+ggplot(sd_days_summary, aes(x = sd_med)) +
+  geom_histogram(binwidth = 0.5, fill = histogram_fill, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(sd_days_summary$sd_med),
+             linetype = "dashed", color = median_color, linewidth = 1) +
+  geom_rug(alpha = 0.05, length = unit(0.02, "npc")) +
+  labs(
+    x = "Within-woman SD of cycle length (days)",
+    y = "Number of women"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Distribution of true mean in days
+ggplot(mean_days_summary, aes(x = mean_med)) +
+  geom_histogram(binwidth = 0.5, fill = histogram_fill, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(mean_days_summary$mean_med),
+             linetype = "dashed", color = median_color, linewidth = 1) +
+  geom_rug(alpha = 0.05, length = unit(0.02, "npc")) +
+  labs(
+    x = "Within-woman mean cycle length (days)",
+    y = "Number of women"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Mean vs. true SD scatter
+mu_sigma_exact <- mean_days_summary %>%
+  inner_join(sd_days_summary, by = "ui_userN") %>%
+  mutate(n_cycles = dat_women$n_cycles)
+ 
+ggplot(mu_sigma_exact, aes(x = mean_med, y = sd_med)) +
+  geom_point(alpha = 0.4, size = 0.8, color = "black") +
+  geom_smooth(method = "loess", se = TRUE, color = histogram_fill, fill = histogram_fill, alpha = 0.2) +
+  labs(
+    x        = "Within-woman average cycle length (days)",
+    y        = "Within-woman SD of cycle length (days, exact)"
+  ) +
+  theme_minimal(base_size = 13)
+
+#add point sizing
+ggplot(mu_sigma_exact, aes(x = mean_med, y = sd_med)) +
+  geom_point(aes(size = n_cycles), alpha = 0.4, color = "black") +
+  scale_size_continuous(
+    name   = "# cycles",
+    range  = c(0.5, 4),      # min and max point size — adjust to taste
+    breaks = c(5, 10, 20, 50) # adjust based on your actual range of n_cycles
+  ) +
+  geom_smooth(method = "loess", se = TRUE, color = histogram_fill, fill = histogram_fill, alpha = 0.2) +
+  labs(
+    x        = "Within-woman average cycle length (days)",
+    y        = "Within-woman SD of cycle length (days, exact)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+```
+
+```{r}
+#subplots of means and SDs by PCOS, endometriosis, and age groups
+char_summary <- mu_sigma_exact %>%
+  left_join(
+    dat_women,
+    by = "ui_userN"
+  ) %>%
+  mutate(ci_age_group = factor(ci_age_group, levels = c("18-24", "25-29", "30-34", "35-39", "40-45")))
+
+#overlaid density for binary groups
+plot_density_binary <- function(data, group_var, group_label) {
+  
+  med_lines <- data %>%
+    group_by({{ group_var }}) %>%
+    summarise(
+      med_mean = median(mean_med),
+      med_sd   = median(sd_med),
+      .groups  = "drop"
+    )
+  
+  p_mean <- ggplot(data, aes(x = mean_med, fill = {{ group_var }}, 
+                              color = {{ group_var }})) +
+    geom_density(alpha = 0.35, linewidth = 0.8) +
+    geom_vline(data = med_lines, 
+               aes(xintercept = med_mean, color = {{ group_var }}),
+               linetype = "dashed", linewidth = 0.9) +
+    labs(x = "Mean cycle length (days)", y = "Density",
+         fill = group_label, color = group_label) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "bottom")
+  
+  p_sd <- ggplot(data, aes(x = sd_med, fill = {{ group_var }}, 
+                            color = {{ group_var }})) +
+    geom_density(alpha = 0.35, linewidth = 0.8) +
+    geom_vline(data = med_lines,
+               aes(xintercept = med_sd, color = {{ group_var }}),
+               linetype = "dashed", linewidth = 0.9) +
+    labs(x = "SD of cycle length (days)", y = "Density",
+         fill = group_label, color = group_label) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "bottom")
+  
+  p_mean | p_sd
+}
+
+#ridge plot for multi-level groups
+plot_ridge <- function(data, group_var, group_label, xmax) {
+  
+  p_mean <- ggplot(data, aes(x = mean_med, y = {{ group_var }}, 
+                              fill = {{ group_var }})) +
+    geom_density_ridges(alpha = 0.7, scale = 0.9,
+                        quantile_lines = TRUE, quantiles = 2) +
+    labs(x = "Mean cycle length (days)", y = group_label) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none")
+  
+  p_sd <- ggplot(data, aes(x = sd_med, y = {{ group_var }}, 
+                            fill = {{ group_var }})) +
+    geom_density_ridges(alpha = 0.7, scale = 0.9,
+                        quantile_lines = TRUE, quantiles = 2) +
+    xlim(0, xmax) +
+    labs(x = "SD of cycle length (days)", y = group_label) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none")
+  
+  p_mean | p_sd
+}
+
+#Plots
+plot_density_binary(char_summary, ui_pcos_impute,          "PCOS")
+plot_density_binary(char_summary, ui_endometriosis_impute, "Endometriosis")
+plot_ridge(char_summary,          ci_age_group,            "Age Group", 12)
+```
+
+
+#### Within-Woman Autocorrelation
+
+```{r}
+## WITHIN-WOMAN AUTOCORRELATION CHECK
+# Compute residuals on the log scale, then check ACF per woman.
+# A meaningful positive ACF at lag 1 would suggest the random intercept
+# alone doesn't capture within-woman serial dependence.
+ 
+log_resid <- log(train$ci_cycleLength) -
+             fitted(fit, scale = "linear")[, "Estimate"]
+ 
+acf_dat <- train %>%
+  mutate(log_resid = log_resid) %>%
+  group_by(ui_userN) %>%
+  filter(n() >= 10) %>%          # only women with enough cycles for ACF
+  summarise(
+    acf_lag1 = {
+      a <- acf(log_resid, lag.max = 1, plot = FALSE)
+      a$acf[2]   # lag-1 autocorrelation
+    },
+    n_cycles = n(),
+    .groups = "drop"
+  )
+ 
+cat("\n========== WITHIN-WOMAN AUTOCORRELATION CHECK ==========\n")
+cat(sprintf("Median lag-1 ACF across women:  %.3f\n", median(acf_dat$acf_lag1)))
+cat(sprintf("IQR:                            [%.3f, %.3f]\n",
+            quantile(acf_dat$acf_lag1, 0.25),
+            quantile(acf_dat$acf_lag1, 0.75)))
+cat(sprintf("%% of women with |ACF| > 0.1:   %.1f%%\n",
+            100 * mean(abs(acf_dat$acf_lag1) > 0.1)))
+cat("  If median ACF is near 0, exchangeability assumption is reasonable.\n")
+cat("  If notably positive, consider an AR(1) random effect for future work.\n")
+```
+
+```{r}
+# Distribution of lag-1 ACF
+ggplot(acf_dat, aes(x = acf_lag1)) +
+  geom_histogram(bins = 60, fill = "#028090", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "#B85042", linewidth = 1) +
+  labs(
+    title    = "Within-woman lag-1 autocorrelation of log-scale residuals",
+    subtitle = sprintf("N = %d women with ≥ 10 cycles; values near 0 support exchangeability",
+                       nrow(acf_dat)),
+    x        = "Lag-1 autocorrelation",
+    y        = "Number of women"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# ACF vs. number of cycles
+ggplot(acf_dat, aes(x = n_cycles, y = acf_lag1)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "loess", se = TRUE, color = "#028090") +
+  labs(
+    title = "Lag-1 ACF vs. number of cycles per woman",
+    x     = "Number of cycles",
+    y     = "Lag-1 ACF"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+#### Scenarios
+
+```{r}
+# Define clinical profile grid:
+# Reference: Age 25-29 | Menarche 12-13 | No PCOS | Active | No sickness
+
+scenario_dat <- tribble(
+  ~scenario_label,                         ~ci_age_group, ~ui_ansMenarche_group, ~ui_pcos_impute, ~ui_activitylevel, ~ci_sickness_logged,
+  "Reference: Age 25-29 | Menarche 12–13 | No PCOS |\n Active | No sickness",
+                                           "25-29",       "12-13",               0,               "Active",          FALSE,
+  "*Age 40-45 | Menarche 12-13 | No PCOS |\n Active | No sickness",
+                                           "40-45",       "12-13",               0,               "Active",          FALSE,
+  "Age 25-29 | *Menarche ≥14 | No PCOS |\n Active | No sickness",
+                                           "25-29",       ">= 14",               0,               "Active",          FALSE,
+  "Age 25-29 | Menarche 12-13 | *PCOS |\n Active | No sickness",
+                                           "25-29",       "12-13",               1,               "Active",          FALSE,
+  "Age 25-29 | Menarche 12-13 | No PCOS |\n *Not active | No sickness",
+                                           "25-29",       "12-13",               0,               "Not active",      FALSE,
+  "Age 25-29 | Menarche 12-13 | No PCOS |\n Active | *Sickness",
+                                           "25-29",       "12-13",               0,               "Active",          TRUE
+) %>%
+  mutate(
+    ui_bmi_cat              = "Healthy Weight",
+    ui_endometriosis_impute = 0,
+    ci_spotting_logged      = FALSE,
+    ci_mood_logged          = FALSE
+  )
+
+# Factor levels to match training data
+scenario_dat <- scenario_dat %>%
+  mutate(
+    ci_age_group            = factor(ci_age_group,            levels = c("18-24", "25-29", "30-34", "35-39", "40-45")),
+    ui_ansMenarche_group    = factor(ui_ansMenarche_group,    levels = c("<= 11", "12-13", ">= 14", "Unknown")),
+    ui_activitylevel        = factor(ui_activitylevel,        levels = c("Active", "Very active", "Not active")),
+    ui_bmi_cat              = factor(ui_bmi_cat,              levels = levels(train$ui_bmi_cat)),
+    ui_pcos_impute          = factor(ui_pcos_impute,          levels = levels(train$ui_pcos_impute)),
+    ui_endometriosis_impute = factor(ui_endometriosis_impute, levels = levels(train$ui_endometriosis_impute)),
+    ci_sickness_logged      = factor(ci_sickness_logged),
+    ci_spotting_logged      = factor(ci_spotting_logged),
+    ci_mood_logged          = factor(ci_mood_logged)
+  )
+```
+
+```{r}
+# Count cycles matching each scenario profile from observed data
+profile_n <- eas %>%
+  mutate(
+    ui_pcos_impute       = as.character(ui_pcos_impute),
+    ci_age_group         = as.character(ci_age_group),
+    ui_ansMenarche_group = as.character(ui_ansMenarche_group),
+    ui_activitylevel     = as.character(ui_activitylevel),
+    ci_sickness_logged   = as.logical(as.character(ci_sickness_logged))
+  ) %>%
+  summarise(n = n(),
+            .by = c(ci_age_group, ui_ansMenarche_group, ui_pcos_impute,
+                    ui_activitylevel, ci_sickness_logged))
+
+# Join n onto scenario_dat
+scenario_dat <- scenario_dat %>%
+  left_join(
+    profile_n %>% mutate(across(c(ci_age_group, ui_ansMenarche_group,
+                                   ui_pcos_impute, ui_activitylevel), as.character),
+                          ci_sickness_logged = as.character(ci_sickness_logged)),
+    by = c("ci_age_group"         = "ci_age_group",
+           "ui_ansMenarche_group" = "ui_ansMenarche_group",
+           "ui_pcos_impute"       = "ui_pcos_impute",
+           "ui_activitylevel"     = "ui_activitylevel",
+           "ci_sickness_logged"   = "ci_sickness_logged")
+  ) %>%
+  mutate(scenario_label = paste0(scenario_label, " (n = ", scales::comma(n), ")"))
+```
+
+```{r}
+n_avail <- posterior::ndraws(fit)
+
+pp_scen <- scenario_dat %>%
+  tidybayes::add_predicted_draws(
+    fit,
+    re_formula = NA,                # population-level scenario contrasts
+    ndraws = min(800, n_avail)
+  ) %>%
+  rename(y_pred = .prediction)
+```
+
+```{r}
+#densities
+ggplot(pp_scen, aes(x = y_pred, y = scenario_label)) +
+  geom_density_ridges(scale = 1.1, rel_min_height = 0.01, alpha = 0.7) +
+  geom_vline(xintercept = c(21, 35), linetype = "dashed",
+             color = "#E69F00", alpha = 0.7) +
+  labs(x = "Predicted cycle length (days)", y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.y = ggtext::element_markdown())
+```
+
+
+

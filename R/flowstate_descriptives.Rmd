@@ -1,0 +1,440 @@
+---
+title: 'Flow State: Descriptive Summary'
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Model & Data Read-In
+
+```{r}
+library(tidyverse)
+library(readr)
+library(here)
+library(gt)
+library(countrycode)
+library(forcats)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(table1)
+
+# Data = eas
+```
+
+## Data Summary
+
+```{r}
+#re-add categorical BMI
+eas$ui_bmi_cat <- factor(case_when(
+  eas$ui_bmi_impute < 18.5 ~ "Underweight",
+  eas$ui_bmi_impute >= 18.5 & eas$ui_bmi_impute < 25 ~ "Healthy Weight",
+  eas$ui_bmi_impute >= 25 & eas$ui_bmi_impute < 30 ~ "Overweight",
+  eas$ui_bmi_impute >= 30 ~ "Obesity"), 
+  levels = c("Healthy Weight", "Underweight", "Overweight", "Obesity"))
+```
+
+```{r}
+#by woman
+eas_cohort_fortable <- eas %>%
+  group_by(ui_userN) %>%
+  slice(1) %>%
+  ungroup()
+
+table1(~ ui_country_top + ui_continent + ui_ansEthnicity + ui_ansEducation + ui_ansRelationship +
+         ui_ansSmoking + ui_recentPregnancy + ui_ansMenarche_group + ui_ansKids_group + ui_ansParity_group +
+         ui_pcos + ui_thyroid + ui_menopause + ui_endometriosis + ui_recentHBC + ui_bmi + ui_bmi_cat + 
+         ui_mean_age + ci_cycleN + ui_activitylevel + 
+         ui_activityunits + nCycles_manual,
+       data = eas_cohort_fortable)
+```
+
+```{r}
+#by cycle
+table1(~ ci_age + ci_age_group + ci_cycleN + 
+         ci_cycleLength + ci_mensLength + 
+         ci_percent_logged + ci_missed_5_consecutive +
+         ci_spotting_logged + ci_sickness_logged + ci_mood_logged,
+       data = eas)
+```
+
+
+```{r}
+#raw distribution of MC length
+n_obs    <- sum(!is.na(eas$ci_cycleLength))
+binwidth <- 1
+scale_factor <- n_obs * binwidth
+
+#colors
+histogram_fill <- "#0072B2"   # blue
+median_color     <- "#E69F00"   # orange  
+mean_color   <- "#000000"   # black
+
+ggplot(eas, aes(x = ci_cycleLength)) +
+  geom_histogram(binwidth = 1, fill = histogram_fill, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = mean(eas$ci_cycleLength),
+             linetype = "dashed", color = mean_color, linewidth = 1) +
+  geom_vline(xintercept = median(eas$ci_cycleLength),
+             linetype = "dashed", color = median_color, linewidth = 1) +
+  geom_rug(alpha = 0.3, length = unit(0.02, "npc")) +
+  labs(
+    x = "Menstrual cycle length (days)",
+    y = "Number of cycles"
+  ) +
+  xlim(15, 60) +
+  theme_minimal(base_size = 13)
+```
+
+## Variable Selection
+
+```{r}
+#create woman-level summaries
+woman_summary <- eas %>%
+  mutate(ui_thyroid_impute = fct_na_value_to_level(ui_thyroid, level = "0")) %>%
+  group_by(ui_userN) %>%
+  summarise(
+    mean_cycle_length = mean(ci_cycleLength, na.rm = TRUE),
+    sd_cycle_length = sd(ci_cycleLength, na.rm = TRUE),
+    ui_thyroid_impute = first(ui_thyroid_impute)
+  ) %>%
+  left_join(
+    eas_cohort_fortable,
+    by = "ui_userN"
+  )
+
+#function to create summary table
+make_summary <- function(data, var, prevalence_denominator = "women") {
+
+  var_sym <- rlang::sym(var)
+
+  out <- data %>%
+    group_by(!!var_sym) %>%
+    summarise(
+      n = n(),
+
+      prevalence = case_when(
+        prevalence_denominator == "women" ~
+          paste0(round(100 * n / nrow(data), 1), "%"),
+
+        TRUE ~
+          paste0(round(100 * n / nrow(data), 1), "%")
+      ),
+
+      median_within_woman_mean =
+        round(median(mean_cycle_length, na.rm = TRUE), 1),
+
+      median_within_woman_sd =
+        round(median(sd_cycle_length, na.rm = TRUE), 1)
+    ) %>%
+    dplyr::select(-n) %>%
+    rename(
+      Predictor_Level = !!var_sym,
+      Prevalence = prevalence,
+      `Median Within-Woman Cycle Length Mean` = median_within_woman_mean,
+      `Median Within-Woman Cycle Length SD` = median_within_woman_sd
+    )
+
+  return(out)
+}
+
+#create summaries for woman-level variables
+menarche_summary <- make_summary(
+  woman_summary,
+  "ui_ansMenarche_group"
+)
+
+pregnancy_summary <- make_summary(
+  woman_summary,
+  "ui_recentPregnancy"
+)
+
+kids_summary <- make_summary(
+  woman_summary,
+  "ui_ansKids_group"
+)
+
+parity_summary <- make_summary(
+  woman_summary,
+  "ui_ansParity_impute"
+)
+
+pcos_summary <- make_summary(
+  woman_summary,
+  "ui_pcos_impute"
+)
+
+endo_summary <- make_summary(
+  woman_summary,
+  "ui_endometriosis_impute"
+)
+
+thyroid_summary <- make_summary(
+  woman_summary,
+  "ui_thyroid_impute"
+)
+
+activity_summary <- make_summary(
+  woman_summary,
+  "ui_activitylevel"
+)
+
+bmi_summary <- make_summary(
+  woman_summary,
+  "ui_bmi_cat"
+)
+
+#function for cycle-level variables
+make_cycle_summary <- function(cycle_data,
+                               woman_data,
+                               var) {
+
+  var_sym <- rlang::sym(var)
+
+  # prevalence from cycles
+  prev_tbl <- cycle_data %>%
+    group_by(!!var_sym) %>%
+    summarise(
+      n_cycles = n()
+    ) %>%
+    mutate(
+      Prevalence =
+        paste0(round(100 * n_cycles / nrow(cycle_data), 1), "%")
+    ) %>%
+    dplyr::select(-n_cycles)
+
+  # woman-level summaries
+  woman_tbl <- cycle_data %>%
+    group_by(ui_userN, !!var_sym) %>%
+    summarise(
+      mean_cycle_length =
+        mean(ci_cycleLength, na.rm = TRUE),
+
+      sd_cycle_length =
+        sd(ci_cycleLength, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    group_by(!!var_sym) %>%
+    summarise(
+      `Median Within-Woman Cycle Length Mean` =
+        round(median(mean_cycle_length, na.rm = TRUE), 1),
+
+      `Median Within-Woman Cycle Length SD` =
+        round(median(sd_cycle_length, na.rm = TRUE), 1)
+    )
+
+  out <- left_join(
+    prev_tbl,
+    woman_tbl,
+    by = var
+  ) %>%
+    rename(
+      Predictor_Level = !!var_sym
+    ) %>%
+    select(
+      Predictor_Level,
+      Prevalence,
+      `Median Within-Woman Cycle Length Mean`,
+      `Median Within-Woman Cycle Length SD`
+    )
+
+  return(out)
+}
+
+age_summary <- make_cycle_summary(
+  eas,
+  woman_summary,
+  "ci_age_group"
+)
+
+spotting_summary <- make_cycle_summary(
+  eas,
+  woman_summary,
+  "ci_spotting_logged"
+)
+
+sickness_summary <- make_cycle_summary(
+  eas,
+  woman_summary,
+  "ci_sickness_logged"
+)
+
+mood_summary <- make_cycle_summary(
+  eas,
+  woman_summary,
+  "ci_mood_logged"
+)
+```
+
+```{r}
+#combine
+clean_summary <- function(dat, predictor_name) {
+  dat %>%
+    mutate(
+      Predictor = predictor_name,
+      Predictor_Level = as.character(Predictor_Level)
+    )
+}
+
+final_summary_table <- bind_rows(
+  clean_summary(menarche_summary, "Age of Menarche"),
+  clean_summary(pregnancy_summary, "Recent Pregnancy"),
+  clean_summary(kids_summary, "Children in Home"),
+  clean_summary(parity_summary, "Parity"),
+  clean_summary(pcos_summary, "PCOS"),
+  clean_summary(endo_summary, "Endometriosis"),
+  clean_summary(thyroid_summary, "Thyroid Condition"),
+  clean_summary(bmi_summary, "BMI Category"),
+  clean_summary(activity_summary, "Physical Activity Level"),
+  clean_summary(age_summary, "Age Group"),
+  clean_summary(spotting_summary, "Logged Spotting"),
+  clean_summary(sickness_summary, "Logged Sickness"),
+  clean_summary(mood_summary, "Mood Symptom")
+) %>%
+  dplyr::select(
+    Predictor,
+    Predictor_Level,
+    Prevalence,
+    `Median Within-Woman Cycle Length Mean`,
+    `Median Within-Woman Cycle Length SD`
+  )
+```
+
+## Crosstabs/Correlations
+
+```{r}
+#Cramér's V
+cramers_v <- function(tbl) {
+  chi2 <- chisq.test(tbl, simulate.p.value = TRUE)$statistic
+  n    <- sum(tbl)
+  k    <- min(nrow(tbl), ncol(tbl))
+  sqrt(chi2 / (n * (k - 1)))
+}
+
+#cross-tab with chi-square and Cramér's V
+crosstab_summary <- function(data, var1, var2) {
+  tbl <- table(data[[var1]], data[[var2]], useNA = "ifany")
+  chi <- chisq.test(tbl, simulate.p.value = TRUE)
+  v   <- cramers_v(tbl)
+  
+  cat("\n========================================\n")
+  cat(sprintf("%s  x  %s\n", var1, var2))
+  cat("========================================\n")
+  print(round(prop.table(tbl, margin = 1) * 100, 1))
+  cat(sprintf("\nCramér's V = %.3f   (p = %.4f)\n", v, chi$p.value))
+  cat("Cramér's V: <0.1 negligible, 0.1-0.3 small, 0.3-0.5 moderate, >0.5 large\n")
+}
+
+#pairs of interest
+crosstab_summary(eas_cohort_fortable, "ui_activitylevel",    "ui_bmi_cat")
+crosstab_summary(eas_cohort_fortable, "ui_activitylevel",    "ui_ansMenarche_group")
+crosstab_summary(eas_cohort_fortable, "ui_ansMenarche_group","ui_pcos_impute")
+crosstab_summary(eas_cohort_fortable, "ui_ansMenarche_group","ui_endometriosis_impute")
+
+#full pairwise Cramér's V matrix (person-level)
+predictors <- c(
+  "ui_activitylevel",
+  "ui_bmi_cat",
+  "ui_ansMenarche_group",
+  "ui_pcos_impute",
+  "ui_endometriosis_impute",
+  "ci_age_group"
+)
+
+cramer_matrix <- matrix(NA,
+                        nrow = length(predictors),
+                        ncol = length(predictors),
+                        dimnames = list(predictors, predictors))
+
+for (i in seq_along(predictors)) {
+  for (j in seq_along(predictors)) {
+    if (i == j) {
+      cramer_matrix[i, j] <- 1
+    } else {
+      tbl <- table(eas_cohort_fortable[[predictors[i]]], eas_cohort_fortable[[predictors[j]]])
+      cramer_matrix[i, j] <- tryCatch(
+        cramers_v(tbl),
+        error = function(e) NA
+      )
+    }
+  }
+}
+
+print(round(cramer_matrix, 3))
+```
+
+```{r}
+#reorder levels for table
+eas_cohort_fortable <- eas_cohort_fortable %>%
+  mutate(
+    ui_activitylevel = factor(ui_activitylevel, 
+                               levels = c("Not active", "Active", "Very active")),
+    ui_ansMenarche_group = factor(ui_ansMenarche_group, 
+                                   levels = c("<= 11", "12-13", ">= 14", "Unknown")),
+    ci_age_group = factor(ci_age_group, 
+                           levels = c("18-24", "25-29", "30-34", "35-39", "40-45")),
+    ui_bmi_cat = factor(ui_bmi_cat,
+                        levels = c("Underweight", "Healthy Weight", "Overweight", "Obesity")),
+    ui_pcos_impute = ifelse(ui_pcos_impute == 0, "No/Missing", "Yes"),
+    ui_endometriosis_impute = ifelse(ui_endometriosis_impute == 0, "No/Missing", "Yes")
+  )
+
+#returns a tidy proportion table with Cramér's V
+crosstab_tidy <- function(data, var1, var2, var1_label, var2_label) {
+  tbl <- table(data[[var1]], data[[var2]], useNA = "ifany")
+  props <- round(prop.table(tbl, margin = 1) * 100, 1)
+  v <- cramers_v(tbl)
+  
+  as.data.frame(props) %>%
+    rename(!!var1_label := Var1, !!var2_label := Var2, Percent = Freq) %>%
+    mutate(CramersV = round(v, 3))
+}
+
+#generate each table
+predictors <- list(
+  list(var = "ui_activitylevel",        label = "Activity Level"),
+  list(var = "ui_bmi_cat",              label = "BMI Category"),
+  list(var = "ui_ansMenarche_group",    label = "Age at Menarche"),
+  list(var = "ui_pcos_impute",          label = "PCOS"),
+  list(var = "ui_endometriosis_impute", label = "Endometriosis"),
+  list(var = "ci_age_group",            label = "Age Group")
+)
+
+pairs <- combn(seq_along(predictors), 2, simplify = FALSE) %>%
+  map(~ list(
+    predictors[[.x[1]]]$var,
+    predictors[[.x[2]]]$var,
+    predictors[[.x[1]]]$label,
+    predictors[[.x[2]]]$label
+  ))
+
+tables <- map(pairs, ~ crosstab_tidy(
+  eas_cohort_fortable, .x[[1]], .x[[2]], .x[[3]], .x[[4]]
+))
+
+#print as gt tables
+walk2(tables, pairs, function(tbl, pair) {
+  
+  v_val <- unique(tbl$CramersV)
+  
+  tbl %>%
+    select(-CramersV) %>%
+    pivot_wider(names_from = 2, values_from = Percent) %>%
+    gt() %>%
+    tab_header(
+      title    = sprintf("%s by %s", pair[[3]], pair[[4]]),
+      subtitle = sprintf("Cramér's V = %.3f", v_val)
+    ) %>%
+    cols_label(!!pair[[3]] := pair[[3]]) %>%
+    tab_spanner(
+      label   = pair[[4]],
+      columns = -1
+    ) %>%
+    fmt_number(decimals = 1) %>%
+    tab_source_note("Row percentages. Person-level (N = 16,468 women).") %>%
+    print()
+})
+```
+
