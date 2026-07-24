@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # Flow State
 
 This repository includes model code to summarize menstrual cycle length
